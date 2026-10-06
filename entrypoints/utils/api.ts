@@ -1,14 +1,22 @@
 import { createApiClient } from "@solidtime/api";
-import { accessToken, endpoint, refreshAccessToken } from "./oauth";
+import { accessToken, endpoint, refreshAccessToken, waitForSettings } from "./oauth";
+import { backgroundApiAdapter, isExtensionApiContext } from "./apiTransport";
 
 export const apiClient = () => {
-  const client = createApiClient(endpoint.value + "/api", {
+  // Zodios requires a nonempty constructor base; no host is selected here.
+  const client = createApiClient("/api", {
     validate: "none",
-    axiosConfig: {
-      headers: {
-        Authorization: `Bearer ${accessToken.value}`,
-      },
-    },
+  });
+  const backgroundTransport = !isExtensionApiContext();
+  if (backgroundTransport) client.axios.defaults.adapter = backgroundApiAdapter;
+
+  // Content scripts may create clients before shared settings have hydrated.
+  // Resolve both host and auth header at dispatch, including retried requests.
+  client.axios.interceptors.request.use(async (config) => {
+    await waitForSettings();
+    config.baseURL = endpoint.value.replace(/\/+$/, "") + "/api";
+    config.headers.Authorization = `Bearer ${accessToken.value}`;
+    return config;
   });
 
   // Add response interceptor to handle 401 errors and refresh token
@@ -18,7 +26,7 @@ export const apiClient = () => {
       const originalRequest = error.config;
 
       // If 401 and we haven't already tried to refresh
-      if (error.response?.status === 401 && !originalRequest._retry) {
+      if (!backgroundTransport && originalRequest && error.response?.status === 401 && !originalRequest._retry) {
         originalRequest._retry = true;
 
         try {

@@ -3,8 +3,11 @@ import { defineConfig } from "wxt";
 // See https://wxt.dev/api/config.html
 export default defineConfig({
   modules: ["@wxt-dev/module-vue"],
-  manifest: {
-    permissions: ["storage", "identity"],
+  manifest: ({ browser }) => ({
+    permissions: ["storage", "identity", ...(browser === "firefox" ? [] : ["scripting"])],
+    // Existing required access also covers exact custom hosts. Chrome's
+    // permissions.request can restore withheld required access; Firefox MV2
+    // checks this grant instead. Do not add redundant optional host access.
     host_permissions: ["<all_urls>"],
     name: "Solidtime",
     description:
@@ -25,7 +28,7 @@ export default defineConfig({
         },
       },
     },
-  },
+  }),
   webExt: {
     disabled: false,
   },

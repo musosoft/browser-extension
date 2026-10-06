@@ -1,4 +1,24 @@
+import { createRefreshTokenCoordinator } from "./utils/refreshTokenCoordinator";
+import { API_REQUEST, createBackgroundApiTransport } from "./utils/apiTransport";
+import { createCustomIntegrationRegistration } from "./utils/customIntegrationRegistration";
+import { CUSTOM_DOMAINS_RECONCILE, CUSTOM_INTEGRATION_DOMAINS_KEY } from "./utils/customIntegrationDomainRules";
+
 export default defineBackground(() => {
+  const customIntegrations = createCustomIntegrationRegistration(browser);
+  const reconcileCustomIntegrations = () => {
+    void customIntegrations.reconcile().catch(error => console.error('Solidtime: Custom integration registration failed', error));
+  };
+  browser.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && changes[CUSTOM_INTEGRATION_DOMAINS_KEY]) reconcileCustomIntegrations();
+  });
+  browser.permissions.onAdded.addListener(reconcileCustomIntegrations);
+  browser.permissions.onRemoved.addListener(reconcileCustomIntegrations);
+  reconcileCustomIntegrations();
+  const tokens = createRefreshTokenCoordinator(browser.storage.local, fetch);
+  // Explicit login/logout supersedes an in-flight API request even if the
+  // coordinator returns a newer pair while processing its queued refresh.
+  let authSessionRevision = 0;
+  const apiRequest = createBackgroundApiTransport(browser.storage.local, tokens.refresh, () => authSessionRevision);
   // OAuth state
   let oauthState = "";
   let oauthVerifier = "";
@@ -27,6 +47,23 @@ export default defineBackground(() => {
 
   // Listen for messages from popup or content scripts
   browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message?.type === CUSTOM_DOMAINS_RECONCILE) {
+      // Only extension pages can request reconciliation; website content scripts
+      // cannot cause arbitrary injections through this message endpoint.
+      if (sender.id !== browser.runtime.id || !sender.url?.startsWith(browser.runtime.getURL('/'))) return false;
+      void customIntegrations.reconcile().then(
+        () => sendResponse({ success: true }),
+        error => sendResponse({ success: false, error: error instanceof Error ? error.message : 'Registration failed' }),
+      );
+      return true;
+    }
+    if (message?.type === API_REQUEST) {
+      if (sender.id !== browser.runtime.id) return false;
+      // Callback + literal true works in Chrome MV3 and Firefox; a Promise
+      // listener can claim unrelated OAuth messages on older Chrome versions.
+      void apiRequest(message.payload).then(sendResponse);
+      return true;
+    }
     if (message.type === "START_OAUTH_FLOW") {
       // Handle entire OAuth flow in background
       const { endpoint, clientId } = message.payload;
@@ -106,19 +143,15 @@ export default defineBackground(() => {
                   throw new Error("Token exchange failed");
                 }
 
-                const tokens = await tokenResponse.json();
-
-                // Store tokens in chrome.storage
-                await browser.storage.local.set({
-                  access_token: tokens.access_token,
-                  refresh_token: tokens.refresh_token,
-                });
+                const tokenData = await tokenResponse.json();
+                authSessionRevision++;
+                const pair = await tokens.login(tokenData);
 
                 sendResponse({
                   success: true,
                   data: {
-                    access_token: tokens.access_token,
-                    refresh_token: tokens.refresh_token,
+                    access_token: pair.access_token,
+                    refresh_token: pair.refresh_token,
                   },
                 });
               } catch (error) {
@@ -144,33 +177,26 @@ export default defineBackground(() => {
     }
 
     if (message.type === "REFRESH_TOKEN") {
-      const { endpoint, clientId, refreshToken } = message.payload;
-
-      fetch(endpoint + "/oauth/token", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-        },
-        body: new URLSearchParams({
-          grant_type: "refresh_token",
-          client_id: clientId,
-          refresh_token: refreshToken,
-        }),
-      })
-        .then(async (response) => {
-          if (!response.ok) {
-            throw new Error("Failed to refresh token");
-          }
-          return response.json();
-        })
+      tokens.refresh(message.payload)
         .then((data) => {
           sendResponse({ success: true, data });
         })
         .catch((error) => {
-          console.error("Token refresh error:", error);
+          console.error("Token refresh error:", error.message);
           sendResponse({ success: false, error: error.message });
         });
 
+      return true;
+    }
+
+    if (message.type === "LOGOUT") {
+      authSessionRevision++;
+      tokens.logout()
+        .then(() => sendResponse({ success: true }))
+        .catch((error) => {
+          console.error("Logout error:", error.message);
+          sendResponse({ success: false, error: error.message });
+        });
       return true;
     }
 

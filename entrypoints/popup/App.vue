@@ -4,9 +4,10 @@ import {
     Cog6ToothIcon,
     ClipboardIcon,
     CheckIcon,
+    ArrowRightStartOnRectangleIcon,
 } from "@heroicons/vue/16/solid";
-import { ref, watch, onMounted } from "vue";
-import { useQuery } from "@tanstack/vue-query";
+import { ref, watch, onMounted, onUnmounted } from "vue";
+import { useQuery, useQueryClient } from "@tanstack/vue-query";
 import {
     isLoggedIn,
     startOAuthFlow,
@@ -24,8 +25,17 @@ import { useTheme } from "../utils/theme";
 const showInstanceSettingsModal = ref(false);
 const isLoggingIn = ref(false);
 const loginError = ref<string | null>(null);
+const isSigningOut = ref(false);
+const signOutError = ref<string | null>(null);
 const showRedirectUrl = ref(false);
 const copiedRedirectUrl = ref(false);
+const queryClient = useQueryClient();
+
+function refreshPopupQueries() {
+    if (!isLoggedIn.value || document.visibilityState === "hidden") return;
+    // Refresh active popup queries even inside the normal five-minute stale window.
+    void queryClient.invalidateQueries({ refetchType: "active" });
+}
 
 const redirectUrl = getRedirectUrl();
 
@@ -53,6 +63,14 @@ onMounted(() => {
     window.getWeekStartSetting = () => "monday";
 
     useTheme();
+    refreshPopupQueries();
+    window.addEventListener("focus", refreshPopupQueries);
+    document.addEventListener("visibilitychange", refreshPopupQueries);
+});
+
+onUnmounted(() => {
+    window.removeEventListener("focus", refreshPopupQueries);
+    document.removeEventListener("visibilitychange", refreshPopupQueries);
 });
 
 // Watch for login state changes and stop loading spinner
@@ -78,7 +96,17 @@ async function handleLogin() {
 }
 
 async function handleLogout() {
-    await logout();
+    if (isSigningOut.value) return;
+    isSigningOut.value = true;
+    signOutError.value = null;
+    try {
+        await logout();
+    } catch {
+        // Background errors can contain sensitive details; show safe recovery text.
+        signOutError.value = "Could not sign out. Please try again.";
+    } finally {
+        isSigningOut.value = false;
+    }
 }
 
 async function copyRedirectUrl() {
@@ -95,9 +123,13 @@ async function copyRedirectUrl() {
 </script>
 
 <template>
-    <div class="w-[500px] h-[600px] bg-default-background text-white">
+    <div class="w-[500px] h-[600px] bg-default-background text-white flex flex-col">
+        <div v-if="signOutError" role="alert" class="p-2 border-b border-border-primary text-sm flex items-start gap-2">
+            <span class="flex-1">{{ signOutError }}</span>
+            <button type="button" class="text-muted underline shrink-0" aria-label="Dismiss sign-out error" @click="signOutError = null">Dismiss</button>
+        </div>
         <!-- Logged In State -->
-        <div v-if="isLoggedIn" class="h-full flex flex-col">
+        <div v-if="isLoggedIn" class="flex-1 min-h-0 flex flex-col">
             <!-- Header -->
             <div
                 class="h-12 w-full border-b border-border-primary flex justify-between items-center px-4 relative z-50"
@@ -122,6 +154,16 @@ async function copyRedirectUrl() {
                             class="w-5 cursor-pointer text-muted opacity-50 hover:opacity-100"
                         ></Cog6ToothIcon>
                     </button>
+                    <button
+                        type="button"
+                        class="flex items-center gap-1 text-sm text-muted hover:text-white disabled:opacity-50 disabled:cursor-wait shrink-0"
+                        :disabled="isSigningOut"
+                        :aria-busy="isSigningOut"
+                        @click="handleLogout"
+                    >
+                        <ArrowRightStartOnRectangleIcon class="w-4 h-4" aria-hidden="true" />
+                        <span>{{ isSigningOut ? "Signing out…" : "Sign out" }}</span>
+                    </button>
                 </div>
             </div>
 
@@ -134,7 +176,7 @@ async function copyRedirectUrl() {
         <!-- Logged Out State -->
         <div
             v-else
-            class="h-full flex flex-col justify-center items-center p-6"
+            class="flex-1 min-h-0 flex flex-col justify-center items-center p-6"
         >
             <div class="flex flex-col space-y-6 items-center justify-center">
                 <svg

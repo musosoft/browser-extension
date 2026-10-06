@@ -4,7 +4,6 @@ import {
   getIssueTitleFromDOM as getLinearTitleFromDOM,
   findPropertiesSidebar,
   waitForElement as waitForLinearElement,
-  observeUrlChanges as observeLinearUrlChanges,
   injectTimeTrackingSection,
   removeTimeTrackingSection,
 } from "./utils/linear";
@@ -15,23 +14,13 @@ import {
   getIssueTitleFromDOM as getJiraTitleFromDOM,
   findJiraActionsWrapper,
   waitForElement as waitForJiraElement,
-  observeJiraUrlChanges,
   observeJiraActionsWrapper,
   injectJiraTimeTrackingButton,
   removeJiraTimeTrackingButton,
 } from "./utils/jira";
 
-import {
-  isPlaneIssuePage,
-  getPlaneIssueInfo,
-  getIssueTitleFromDOM as getPlaneTitleFromDOM,
-  findPlaneActionsWrapper,
-  waitForElement as waitForPlaneElement,
-  observePlaneUrlChanges,
-  observePlaneActionsWrapper,
-  injectPlaneTimeTrackingButton,
-  removePlaneTimeTrackingButton,
-} from "./utils/plane";
+import { initializePlaneTracking } from "./utils/plane";
+import { CUSTOM_INTEGRATION_DOMAINS_KEY, createIntegrationRouter, readCustomIntegrationDomains } from './utils/customIntegrationDomainRules';
 
 export default defineContentScript({
   matches: [
@@ -40,26 +29,40 @@ export default defineContentScript({
     "*://*.atlassian.net/*",
     "*://app.plane.so/*",
   ],
-  main() {
-    // Determine which platform we're on
-    const isLinear = window.location.hostname.includes("linear.app");
-    const isJira = window.location.hostname.includes("atlassian.net");
-    const isPlane = window.location.hostname.includes("plane.so");
-
-    if (isLinear) {
-      initializeLinear();
-    } else if (isJira) {
-      initializeJira();
-    } else if (isPlane) {
-      initializePlane();
+  async main(ctx) {
+    const router = createIntegrationRouter(integration => {
+      if (integration === 'linear') return initializeLinear();
+      if (integration === 'jira') return initializeJira();
+      return initializePlaneTracking();
+    });
+    let revision = 0;
+    const changed = (changes: Record<string, { newValue?: unknown }>, area: string) => {
+      if (ctx.isInvalid || area !== 'local' || !changes[CUSTOM_INTEGRATION_DOMAINS_KEY]) return;
+      revision++;
+      router.update(window.location.hostname, readCustomIntegrationDomains(changes[CUSTOM_INTEGRATION_DOMAINS_KEY].newValue));
+    };
+    browser.storage.onChanged.addListener(changed);
+    ctx.onInvalidated(() => {
+      browser.storage.onChanged.removeListener(changed);
+      router.stop();
+    });
+    const initialRevision = revision;
+    try {
+      const values = await browser.storage.local.get(CUSTOM_INTEGRATION_DOMAINS_KEY);
+      if (ctx.isValid && revision === initialRevision) router.update(window.location.hostname, readCustomIntegrationDomains(values[CUSTOM_INTEGRATION_DOMAINS_KEY]));
+    } catch {
+      // Static defaults remain functional even if custom storage cannot be read.
+      if (ctx.isValid && revision === initialRevision) router.update(window.location.hostname, []);
     }
   },
 });
 
 // Linear integration
 function initializeLinear() {
+  let active = true;
   // Function to inject time tracking if on a Linear issue page
   async function handlePageLoad() {
+    if (!active) return;
     // Check if we're on an issue page
     if (!isLinearIssuePage()) {
       removeTimeTrackingSection();
@@ -78,7 +81,7 @@ function initializeLinear() {
         5000,
       );
 
-      if (!propertiesSidebar) {
+      if (!active || !propertiesSidebar) {
         return;
       }
 
@@ -97,6 +100,7 @@ function initializeLinear() {
 
       // Inject the time tracking section
       await injectTimeTrackingSection(propertiesSidebar, issueDescription);
+      if (!active) removeTimeTrackingSection();
     } catch (error) {
       console.error(
         "Solidtime: Failed to inject time tracking section:",
@@ -109,18 +113,21 @@ function initializeLinear() {
   handlePageLoad();
 
   // Watch for URL changes (Linear is an SPA)
-  observeLinearUrlChanges(() => {
+  const stopUrlObserver = observeIntegrationUrlChanges(() => {
     handlePageLoad();
   });
+  return () => { active = false; stopUrlObserver(); removeTimeTrackingSection(); };
 }
 
 // Jira integration
 function initializeJira() {
+  let active = true;
   // Keep track of the current observer
   let actionsWrapperObserver: MutationObserver | null = null;
 
   // Function to inject time tracking if on a Jira issue page
   async function handlePageLoad() {
+    if (!active) return;
     // Disconnect previous observer if it exists
     if (actionsWrapperObserver) {
       actionsWrapperObserver.disconnect();
@@ -145,7 +152,7 @@ function initializeJira() {
         5000,
       );
 
-      if (!actionsWrapper) {
+      if (!active || !actionsWrapper) {
         return;
       }
 
@@ -163,6 +170,7 @@ function initializeJira() {
 
       // Inject the time tracking button
       await injectJiraTimeTrackingButton(actionsWrapper, issueDescription);
+      if (!active) { removeJiraTimeTrackingButton(); return; }
 
       // Set up observer to watch for DOM changes that might remove the button
       // This observes the entire document body to catch when the actions wrapper itself gets replaced
@@ -179,76 +187,27 @@ function initializeJira() {
   handlePageLoad();
 
   // Watch for URL changes (Jira is an SPA)
-  observeJiraUrlChanges(() => {
-    handlePageLoad();
-  });
+  const stopUrlObserver = observeIntegrationUrlChanges(() => { void handlePageLoad(); });
+  return () => {
+    active = false;
+    stopUrlObserver();
+    actionsWrapperObserver?.disconnect();
+    removeJiraTimeTrackingButton();
+  };
 }
 
-// Plane integration
-function initializePlane() {
-  // Keep track of the current observer
-  let actionsWrapperObserver: MutationObserver | null = null;
-
-  // Function to inject time tracking if on a Plane issue page
-  async function handlePageLoad() {
-    // Disconnect previous observer if it exists
-    if (actionsWrapperObserver) {
-      actionsWrapperObserver.disconnect();
-      actionsWrapperObserver = null;
-    }
-
-    // Check if we're on an issue page
-    if (!isPlaneIssuePage()) {
-      removePlaneTimeTrackingButton();
-      return;
-    }
-
-    // Don't inject if already exists
-    if (document.getElementById("solidtime-plane-tracking-btn")) {
-      return;
-    }
-
-    try {
-      // Wait for the actions wrapper to load
-      const actionsWrapper = await waitForPlaneElement(
-        findPlaneActionsWrapper,
-        5000,
-      );
-
-      if (!actionsWrapper) {
-        return;
-      }
-
-      // Get issue information
-      const issueInfo = getPlaneIssueInfo();
-      if (!issueInfo) {
-        return;
-      }
-
-      // Get the issue title from DOM (more reliable than just the issue key)
-      const issueTitle = getPlaneTitleFromDOM() || issueInfo.issueKey;
-
-      // Create issue description for time entry
-      const issueDescription = `${issueInfo.issueKey} ${issueTitle}`;
-
-      // Inject the time tracking button
-      await injectPlaneTimeTrackingButton(actionsWrapper, issueDescription);
-
-      // Set up observer to watch for DOM changes that might remove the button
-      actionsWrapperObserver = observePlaneActionsWrapper(issueDescription);
-    } catch (error) {
-      console.error(
-        "Solidtime: Failed to inject Plane time tracking button:",
-        error,
-      );
-    }
-  }
-
-  // Initial load
-  handlePageLoad();
-
-  // Watch for URL changes (Plane is an SPA)
-  observePlaneUrlChanges(() => {
-    handlePageLoad();
+// Both observers and popstate listeners must stop when WXT invalidates a copy
+// (e.g. an immediate injection racing with a registered navigation injection).
+function observeIntegrationUrlChanges(callback: () => void): () => void {
+  let lastUrl = window.location.href;
+  const urlObserver = new MutationObserver(() => {
+    if (lastUrl !== window.location.href) { lastUrl = window.location.href; callback(); }
   });
+  urlObserver.observe(document.body, { childList: true, subtree: true });
+  const popstate = callback;
+  window.addEventListener('popstate', popstate);
+  return () => {
+    urlObserver.disconnect();
+    window.removeEventListener('popstate', popstate);
+  };
 }

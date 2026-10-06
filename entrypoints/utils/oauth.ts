@@ -1,37 +1,38 @@
 import { computed, ref } from "vue";
-import { useStorage } from "@vueuse/core";
+import { createInstanceSettings } from "./instanceSettings";
 
-export const endpoint = useStorage(
-  "instance_endpoint",
-  "https://app.solidtime.io",
-);
-export const clientId = useStorage(
-  "instance_client_id",
-  "019b27e8-a52a-71d8-8d67-071cff97f315",
-);
+export const { endpoint, clientId, settingsReady, persistSettings, waitForSettings } =
+  createInstanceSettings(browser);
 
 // Use chrome.storage for tokens (survives popup closing)
 export const accessToken = ref("");
 export const refreshToken = ref("");
+let tokenStorageRevision = 0;
 
 // Load tokens from chrome.storage on init
 async function loadTokens() {
+  const revision = tokenStorageRevision;
   const result = await browser.storage.local.get([
     "access_token",
     "refresh_token",
   ]);
-  accessToken.value = result.access_token || "";
-  refreshToken.value = result.refresh_token || "";
+  // A newer token event takes precedence over the initial storage snapshot.
+  if (revision !== tokenStorageRevision) return;
+  accessToken.value = typeof result.access_token === "string" ? result.access_token : "";
+  refreshToken.value = typeof result.refresh_token === "string" ? result.refresh_token : "";
 }
 
 // Watch for storage changes (from background script)
 browser.storage.onChanged.addListener((changes, area) => {
   if (area === "local") {
+    if (changes.access_token || changes.refresh_token) {
+      tokenStorageRevision++;
+    }
     if (changes.access_token) {
-      accessToken.value = changes.access_token.newValue || "";
+      accessToken.value = typeof changes.access_token.newValue === "string" ? changes.access_token.newValue : "";
     }
     if (changes.refresh_token) {
-      refreshToken.value = changes.refresh_token.newValue || "";
+      refreshToken.value = typeof changes.refresh_token.newValue === "string" ? changes.refresh_token.newValue : "";
     }
   }
 });
@@ -53,14 +54,13 @@ export async function refreshAccessToken(): Promise<void> {
 
   const currentRefreshToken = refreshToken.value;
   if (!currentRefreshToken) {
-    accessToken.value = "";
-    refreshToken.value = "";
-    await browser.storage.local.remove(["access_token", "refresh_token"]);
-    throw new Error("No refresh token available - user logged out");
+    throw new Error("No refresh token available");
   }
 
+  const revision = tokenStorageRevision;
   refreshPromise = (async () => {
     try {
+      await waitForSettings();
       const response = await browser.runtime.sendMessage({
         type: "REFRESH_TOKEN",
         payload: {
@@ -74,19 +74,12 @@ export async function refreshAccessToken(): Promise<void> {
         throw new Error(response.error || "Failed to refresh token");
       }
 
-      // Update tokens
-      await browser.storage.local.set({
-        access_token: response.data.access_token,
-        refresh_token: response.data.refresh_token,
-      });
-
-      accessToken.value = response.data.access_token;
-      refreshToken.value = response.data.refresh_token;
-    } catch (error) {
-      accessToken.value = "";
-      refreshToken.value = "";
-      await browser.storage.local.remove(["access_token", "refresh_token"]);
-      throw error;
+      // Background persisted the pair before replying. A newer storage event
+      // (including login/logout) must win over a delayed message reply.
+      if (revision === tokenStorageRevision) {
+        accessToken.value = response.data.access_token;
+        refreshToken.value = response.data.refresh_token;
+      }
     } finally {
       refreshPromise = null;
     }
@@ -96,6 +89,9 @@ export async function refreshAccessToken(): Promise<void> {
 }
 
 export async function startOAuthFlow(): Promise<void> {
+  // Includes hydration and any pending popup edits, before OAuth uses them.
+  await waitForSettings();
+  const revision = tokenStorageRevision;
   return new Promise((resolve, reject) => {
     browser.runtime.sendMessage(
       {
@@ -116,6 +112,10 @@ export async function startOAuthFlow(): Promise<void> {
           return;
         }
 
+        if (revision === tokenStorageRevision) {
+          accessToken.value = response.data.access_token;
+          refreshToken.value = response.data.refresh_token;
+        }
         resolve();
       },
     );
@@ -123,7 +123,11 @@ export async function startOAuthFlow(): Promise<void> {
 }
 
 export async function logout() {
-  accessToken.value = "";
-  refreshToken.value = "";
-  await browser.storage.local.remove(["access_token", "refresh_token"]);
+  const revision = tokenStorageRevision;
+  const response = await browser.runtime.sendMessage({ type: "LOGOUT" });
+  if (!response.success) throw new Error(response.error || "Logout failed");
+  if (revision === tokenStorageRevision) {
+    accessToken.value = "";
+    refreshToken.value = "";
+  }
 }

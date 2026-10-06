@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { useQuery } from "@tanstack/vue-query";
-import { computed, onMounted, watch, watchEffect } from "vue";
+import { computed, onMounted, ref, watch, watchEffect } from "vue";
+import { isAxiosError } from "axios";
 import {
     TimeEntryGroupedTable,
     LoadingSpinner,
@@ -15,6 +16,7 @@ import {
 import { useTimer } from "../../utils/useTimer";
 import { useLiveTimer } from "../../utils/liveTimer";
 import { useCurrentTimeEntryUpdateMutation } from "../../utils/timeEntries";
+import { useTimeEntryTableMutations, type CreateTableTimeEntryBody } from "../../utils/timeEntries";
 import { getCurrentTimeEntry } from "../../utils/timeEntries";
 import { emptyTimeEntry } from "../../utils/timeEntries";
 import { dayjs } from "../../utils/dayjs";
@@ -40,7 +42,7 @@ const { data: timeEntriesResponse } = useQuery({
             queries: {
                 member_id: currentMembership.value!.id,
                 limit: 50,
-                only_full_dates: true,
+                only_full_dates: "true",
             },
         });
     },
@@ -133,47 +135,56 @@ async function createClient(clientData: CreateClientBody) {
     return response.data;
 }
 
-async function createTimeEntry(entry: Omit<CreateTimeEntryBody, "member_id">) {
-    const client = apiClient();
-    await client.createTimeEntry(
-        { ...entry, member_id: currentMembership.value!.id },
-        { params: { organization: currentOrganizationId.value! } },
-    );
-}
+const tableMutations = useTimeEntryTableMutations();
+const mutationError = ref<string | null>(null);
+const selectedTimeEntries = ref<TimeEntry[]>([]);
 
-async function updateTimeEntry(entry: TimeEntry) {
-    const client = apiClient();
-    await client.updateTimeEntry(entry, {
-        params: {
-            organization: currentOrganizationId.value!,
-            timeEntry: entry.id,
-        },
-    });
-}
-
-async function updateTimeEntries(ids: string[], changes: Partial<TimeEntry>) {
-    const client = apiClient();
-    await client.updateMultipleTimeEntries(
-        { ids, changes: changes as UpdateMultipleTimeEntriesChangeset },
-        { params: { organization: currentOrganizationId.value! } },
-    );
-}
-
-async function deleteTimeEntries(entries: TimeEntry[]) {
-    const client = apiClient();
-    for (const entry of entries) {
-        await client.deleteTimeEntry({
-            params: {
-                organization: currentOrganizationId.value!,
-                timeEntry: entry.id,
-            },
-        });
+async function withVisibleError<T>(action: string, operation: () => Promise<T>) {
+    try {
+        return await operation();
+    } catch (error) {
+        const apiMessage = isAxiosError(error) ? error.response?.data?.message : null;
+        const detail = typeof apiMessage === "string" ? apiMessage :
+            error instanceof Error ? error.message : "Please try again.";
+        mutationError.value = `Could not ${action}. ${detail}`;
+        throw error;
     }
 }
 
-const selectedTimeEntries = computed({
-    get: () => [],
-    set: () => {},
+async function createTimeEntry(entry: Omit<CreateTimeEntryBody, "member_id">) {
+    return withVisibleError("add the time entry", () => {
+        if (typeof entry.start !== "string" || typeof entry.billable !== "boolean") {
+            throw new Error("A start time and billable status are required.");
+        }
+        return tableMutations.createTimeEntry(entry as CreateTableTimeEntryBody);
+    });
+}
+
+async function updateTimeEntry(entry: TimeEntry) {
+    return withVisibleError("update the time entry", () => tableMutations.updateTimeEntry(entry));
+}
+
+async function updateTimeEntries(ids: string[], changes: Partial<TimeEntry>) {
+    return withVisibleError("update the time entries", () =>
+        tableMutations.updateTimeEntries(ids, changes as UpdateMultipleTimeEntriesChangeset));
+}
+
+async function deleteTimeEntries(entries: TimeEntry[]) {
+    return withVisibleError("delete the time entries", async () => {
+        // Reconcile each confirmed deletion, including partial bulk success.
+        for (const entry of entries) {
+            await tableMutations.deleteTimeEntries([entry]);
+            selectedTimeEntries.value = selectedTimeEntries.value.filter((selected) => selected.id !== entry.id);
+            if (currentTimeEntry.value.id === entry.id) {
+                currentTimeEntry.value = { ...emptyTimeEntry };
+            }
+        }
+    });
+}
+
+watch(timeEntries, (entries) => {
+    const ids = new Set(entries.map((entry) => entry.id));
+    selectedTimeEntries.value = selectedTimeEntries.value.filter((entry) => ids.has(entry.id));
 });
 
 const currency = computed(
@@ -192,7 +203,6 @@ const { currentTimeEntry, lastTimeEntry, isActive, stopTimer, startTimer } =
 // Fetch current time entry
 const {
     data: currentTimeEntryResponse,
-    isError: currentTimeEntryResponseIsError,
 } = useQuery({
     queryKey: ["currentTimeEntry"],
     queryFn: () => getCurrentTimeEntry(),
@@ -209,19 +219,13 @@ watch(
     },
 );
 
-watch(currentTimeEntryResponseIsError, () => {
-    if (currentTimeEntryResponseIsError.value) {
-        // Only reset if we had a previously started timer (has an ID)
-        // Don't reset if user is preparing a new time entry (no ID yet)
-        if (currentTimeEntry.value.id !== '') {
-            currentTimeEntry.value = { ...emptyTimeEntry };
-        }
-    }
-});
-
 watch(currentTimeEntryResponse, () => {
     if (currentTimeEntryResponse.value?.data) {
         currentTimeEntry.value = { ...currentTimeEntryResponse.value?.data };
+    } else if (currentTimeEntryResponse.value && currentTimeEntry.value.id) {
+        // A successful response with no active entry clears persisted timer state.
+        // Network/API failures must not erase a running timer or a new draft.
+        currentTimeEntry.value = { ...emptyTimeEntry };
     }
 });
 
@@ -240,9 +244,10 @@ onMounted(async () => {
 
 const currentTimeEntryUpdateMutation = useCurrentTimeEntryUpdateMutation();
 
-function updateCurrentTimeEntry() {
+async function updateCurrentTimeEntry() {
     if (currentTimeEntry.value?.id) {
-        currentTimeEntryUpdateMutation.mutate(currentTimeEntry.value);
+        await withVisibleError("update the running time entry", () =>
+            currentTimeEntryUpdateMutation.mutateAsync(currentTimeEntry.value));
     }
 }
 
@@ -260,9 +265,13 @@ function switchOrganization() {
 
 <template>
     <div class="w-full h-full bg-default-background flex flex-col">
+        <div v-if="mutationError" role="alert" class="p-2 border-b border-border-primary text-sm flex items-start gap-2">
+            <span class="flex-1">{{ mutationError }}</span>
+            <button type="button" class="text-muted underline shrink-0" aria-label="Dismiss time entry error" @click="mutationError = null">Dismiss</button>
+        </div>
         <div
             v-if="timeEntries && projects && tasks && tags && clients"
-            class="flex flex-col h-full"
+            class="flex flex-col flex-1 min-h-0"
         >
             <!-- Time Tracker Controls -->
             <div class="p-2 border-b border-border-primary relative">

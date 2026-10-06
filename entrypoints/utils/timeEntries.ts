@@ -2,11 +2,102 @@ import { apiClient } from './api'
 import type {
     CreateTimeEntryBody,
     TimeEntry,
-    TimeEntryResponse,
     UpdateMultipleTimeEntriesChangeset,
 } from '@solidtime/api'
-import { useMutation, useQueryClient } from '@tanstack/vue-query'
+import { QueryClient, useMutation, useQueryClient } from '@tanstack/vue-query'
 import { useMyMemberships } from './myMemberships'
+
+// The generated API type has a passthrough index signature, so Omit alone loses
+// the required fields. Retain them explicitly for table-created entries.
+export type CreateTableTimeEntryBody = Omit<CreateTimeEntryBody, 'member_id'> &
+    Pick<CreateTimeEntryBody, 'start' | 'billable'>
+
+/** Table writes must not apply the running timer's optimistic updates. */
+export function createTimeEntryTableApi({
+    queryClient,
+    getOrganizationId,
+    getClient = apiClient,
+}: {
+    queryClient: QueryClient
+    getOrganizationId: () => string | null | undefined
+    getClient?: typeof apiClient
+}) {
+    function organizationId() {
+        const id = getOrganizationId()
+        if (!id) throw new Error('No current organization id - mutate time entry')
+        return id
+    }
+
+    async function refresh(organization: string) {
+        // Capture the organization before the request: selection can change in flight.
+        // Refresh inactive caches too, so reopening the table cannot show stale rows.
+        await Promise.all([
+            queryClient.invalidateQueries({
+                queryKey: ['timeEntries', organization],
+                refetchType: 'all',
+            }),
+            queryClient.invalidateQueries({ queryKey: ['currentTimeEntry'] }),
+        ])
+    }
+
+    return {
+        async createTimeEntry(entry: CreateTimeEntryBody) {
+            const organization = organizationId()
+            const response = await getClient().createTimeEntry(entry, {
+                params: { organization },
+            })
+            await refresh(organization)
+            return response
+        },
+        async updateTimeEntry(entry: TimeEntry) {
+            const organization = organizationId()
+            const response = await getClient().updateTimeEntry(entry, {
+                params: { organization, timeEntry: entry.id },
+            })
+            await refresh(organization)
+            return response
+        },
+        async updateTimeEntries(ids: string[], changes: UpdateMultipleTimeEntriesChangeset) {
+            const organization = organizationId()
+            const response = await getClient().updateMultipleTimeEntries(
+                { ids, changes },
+                { params: { organization } }
+            )
+            await refresh(organization)
+            return response
+        },
+        async deleteTimeEntries(entries: TimeEntry[]) {
+            const organization = organizationId()
+            const client = getClient()
+            for (const entry of entries) {
+                // DELETE returns 204/void; do not inspect response.data.
+                await client.deleteTimeEntry(undefined, {
+                    params: { organization, timeEntry: entry.id },
+                })
+                // Also reconcile successful deletes if a later delete fails.
+                await refresh(organization)
+            }
+        },
+    }
+}
+
+export function useTimeEntryTableMutations() {
+    const queryClient = useQueryClient()
+    const { currentOrganizationId, currentMembership } = useMyMemberships()
+    const api = createTimeEntryTableApi({
+        queryClient,
+        getOrganizationId: () => currentOrganizationId.value,
+    })
+
+    return {
+        ...api,
+        async createTimeEntry(entry: CreateTableTimeEntryBody) {
+            const memberId = currentMembership.value?.id
+            if (!memberId) throw new Error('No current membership id - create time entry')
+            return api.createTimeEntry({ ...entry, member_id: memberId })
+        },
+    }
+}
 
 export const emptyTimeEntry = {
     id: '',
@@ -24,9 +115,21 @@ export const emptyTimeEntry = {
 
 const offlineUuidStore = {} as Record<string, string>
 
-export function getCurrentTimeEntry() {
-    const client = apiClient()
-    return client.getMyActiveTimeEntry({})
+export async function getCurrentTimeEntry(client = apiClient()) {
+    try {
+        return await client.getMyActiveTimeEntry({})
+    } catch (error) {
+        // Solidtime returns 404 when the user has no active timer; that is the
+        // normal idle state, not a failed status lookup.
+        if (typeof error === 'object' && error !== null &&
+            'response' in error &&
+            (error as { response?: { status?: unknown } }).response?.status === 404) {
+            // Preserve the generated client's response envelope; popup,
+            // Linear, Jira, and Plane consumers read `.data`.
+            return { data: null }
+        }
+        throw error
+    }
 }
 
 export function useTimeEntryStopMutation() {

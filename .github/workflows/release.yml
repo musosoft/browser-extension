@@ -8,6 +8,8 @@ on:
 jobs:
   release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Check out Git repository
@@ -36,8 +38,8 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          draft: true
+          draft: false
           files: |
             .output/*.zip
         env:
-          GITHUB_TOKEN: ${{ secrets.SECRET_GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
